@@ -1,4 +1,5 @@
-use crate::{AppState, LoginPayload, SignUpPayload, User};
+use crate::{AppState, AuthenticationError, LoginPayload, PartialUser, SignUpPayload, User};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State, http::StatusCode, http::header};
 use bcrypt::{Version::TwoB, hash_with_salt, verify};
@@ -6,7 +7,7 @@ use chrono::Utc;
 use cookie::Cookie;
 use cookie::time::Duration;
 use hmac::{Hmac, Mac};
-use jwt::SignWithKey;
+use jwt::{SignWithKey, VerifyWithKey};
 use rand::{TryRngCore, rngs::OsRng};
 use serde_json::json;
 use sha2::Sha256;
@@ -22,8 +23,7 @@ enum TokenType {
 fn generate_token(
     token_type: TokenType,
     secrets: &shuttle_runtime::SecretStore,
-    username: &String,
-    name: &String,
+    user: &PartialUser,
     exp_hours: i64,
 ) -> String {
     let secret_name = if token_type == TokenType::RegularToken {
@@ -32,7 +32,7 @@ fn generate_token(
         "REFRESH_TOKEN_SECRET"
     };
 
-    let token_secret = secrets
+    let token_secret: String = secrets
         .get(secret_name)
         .expect("jwt token key must be in secrets");
 
@@ -42,8 +42,8 @@ fn generate_token(
         .timestamp() as usize;
 
     let mut claims = BTreeMap::new();
-    claims.insert("username", username.clone());
-    claims.insert("name", name.clone());
+    claims.insert("username", user.username.clone());
+    claims.insert("name", user.name.clone());
     claims.insert("exp", expiration.to_string());
 
     let key: Hmac<Sha256> =
@@ -54,7 +54,44 @@ fn generate_token(
     return token;
 }
 
-// pub fn authenticate_token(secrets: shuttle_runtime::SecretStore, token: String) {}
+pub fn authenticate_token(
+    secrets: shuttle_runtime::SecretStore,
+    headers: HeaderMap,
+) -> Result<PartialUser, AuthenticationError> {
+    let auth_header = if let Some(header) = headers.get(header::AUTHORIZATION) {
+        header
+            .to_str()
+            .map_err(|_| AuthenticationError::InvalidToken)?
+    } else {
+        return Err(AuthenticationError::TokenNotFound);
+    };
+
+    let token_str = if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        token
+    } else {
+        return Err(AuthenticationError::InvalidToken);
+    };
+
+    let token_secret = secrets.get("JWT_SECRET").expect("JWT_SECRET must be set");
+
+    let key: Hmac<Sha256> =
+        Hmac::new_from_slice(token_secret.as_bytes()).expect("HMAC key should be valid");
+
+    let claims: BTreeMap<String, String> = token_str
+        .verify_with_key(&key)
+        .map_err(|_| AuthenticationError::InvalidToken)?;
+
+    let username = claims
+        .get("username")
+        .ok_or(AuthenticationError::InvalidToken)?
+        .clone();
+    let name = claims
+        .get("name")
+        .ok_or(AuthenticationError::InvalidToken)?
+        .clone();
+
+    Ok(PartialUser { username, name })
+}
 
 fn create_refresh_cookie(refresh_token: &String) -> Cookie<'_> {
     let mut refresh_cookie = Cookie::new("refreshToken", refresh_token.to_string());
@@ -69,20 +106,19 @@ fn create_refresh_cookie(refresh_token: &String) -> Cookie<'_> {
 
 fn auth_response(
     secrets: &shuttle_runtime::SecretStore,
-    username: &String,
-    name: &String,
+    user: &PartialUser,
     message: &str,
 ) -> Response {
-    let token = generate_token(TokenType::RegularToken, &secrets, &username, &name, 4);
+    let token = generate_token(TokenType::RegularToken, &secrets, &user, 4);
 
-    let refresh_token = generate_token(TokenType::RefreshToken, &secrets, &username, &name, 720);
+    let refresh_token = generate_token(TokenType::RefreshToken, &secrets, &user, 720);
 
     let refresh_token_cookie = create_refresh_cookie(&refresh_token);
 
     let response_json = json!({
     "message": message,
     "token" : token,
-    "user": { "username": username, "name": name }
+    "user": { "username": user.username, "name": user.name }
     });
 
     (
@@ -91,6 +127,29 @@ fn auth_response(
         Json(response_json),
     )
         .into_response()
+}
+
+pub async fn authentication_tester(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    // Json(payload): Json<SignUpPayload>,
+) -> impl IntoResponse {
+    let partial_user = authenticate_token(state.secrets, headers);
+
+    match partial_user {
+        Ok(user) => {
+            let message = json!({ "message": "Token reconhecido com sucesso", "username" : user.username, "name" : user.name });
+            return (StatusCode::OK, Json(message));
+        }
+        Err(AuthenticationError::InvalidToken) => {
+            let error = json!({ "message": "Invalid Token" });
+            return (StatusCode::UNAUTHORIZED, Json(error));
+        }
+        Err(AuthenticationError::TokenNotFound) => {
+            let error = json!({ "message": "Token not found" });
+            return (StatusCode::UNAUTHORIZED, Json(error));
+        }
+    }
 }
 
 pub async fn signup_handler(
@@ -145,12 +204,12 @@ pub async fn signup_handler(
 
     match insert_user_result {
         Ok(_) => {
-            return auth_response(
-                &state.secrets,
-                &payload.username,
-                &payload.name,
-                "Conta criada com sucesso",
-            );
+            let user: PartialUser = PartialUser {
+                username: (payload.username),
+                name: (payload.name),
+            };
+
+            return auth_response(&state.secrets, &user, "Conta criada com sucesso");
         }
         Err(_) => {
             let error = json!({ "message": "Erro interno do servidor" });
@@ -189,12 +248,12 @@ pub async fn login_handler(
                         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
                     }
 
-                    return auth_response(
-                        &state.secrets,
-                        &user.username,
-                        &user.name,
-                        "Login bem-sucedido",
-                    );
+                    let partial_user: PartialUser = PartialUser {
+                        username: (user.username),
+                        name: (user.name),
+                    };
+
+                    return auth_response(&state.secrets, &partial_user, "Login bem-sucedido");
                 }
             }
         }

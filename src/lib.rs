@@ -25,6 +25,16 @@ pub struct AppState {
     pub secrets: shuttle_runtime::SecretStore,
 }
 
+pub enum AuthenticationError {
+    TokenNotFound,
+    InvalidToken,
+}
+
+pub struct PartialUser {
+    username: String,
+    name: String,
+}
+
 #[derive(Debug, FromRow)]
 pub struct User {
     pub id: Uuid,

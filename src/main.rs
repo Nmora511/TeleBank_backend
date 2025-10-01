@@ -1,4 +1,7 @@
-use axum::{Router, routing::post};
+use axum::{
+    Router,
+    routing::{get, post},
+};
 
 use sqlx::{Pool, Postgres};
 use telebank_backend::{AppState, connect_db::connect_db, routes};
@@ -20,6 +23,7 @@ async fn main(
     let router = Router::new()
         .route("/auth/login", post(routes::auth::login_handler))
         .route("/auth/sign-up", post(routes::auth::signup_handler))
+        .route("/auth/test", get(routes::auth::authentication_tester))
         .with_state(state);
 
     Ok(router.into())
