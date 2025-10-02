@@ -24,6 +24,7 @@ async fn main(
         .route("/auth/login", post(routes::auth::login_handler))
         .route("/auth/sign-up", post(routes::auth::signup_handler))
         .route("/auth/test", get(routes::auth::authentication_tester))
+        .route("/auth/refresh", post(routes::auth::refresh_handler))
         .with_state(state);
 
     Ok(router.into())

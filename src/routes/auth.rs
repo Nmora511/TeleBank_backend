@@ -2,20 +2,20 @@ use crate::{AppState, AuthenticationError, LoginPayload, PartialUser, SignUpPayl
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State, http::StatusCode, http::header};
+use axum_extra::extract::cookie::{Cookie, CookieJar};
 use bcrypt::{Version::TwoB, hash_with_salt, verify};
 use chrono::Utc;
-use cookie::Cookie;
 use cookie::time::Duration;
 use hmac::{Hmac, Mac};
 use jwt::{SignWithKey, VerifyWithKey};
 use rand::{TryRngCore, rngs::OsRng};
 use serde_json::json;
 use sha2::Sha256;
-use sqlx::Result;
+use sqlx::{Error, Pool, Postgres, Result};
 use std::collections::BTreeMap;
 
 #[derive(PartialEq)]
-enum TokenType {
+pub enum TokenType {
     RefreshToken,
     RegularToken,
 }
@@ -54,8 +54,55 @@ fn generate_token(
     return token;
 }
 
-pub fn authenticate_token(
-    secrets: shuttle_runtime::SecretStore,
+pub async fn user_query(pool: &Pool<Postgres>, username: &String) -> Result<User, Error> {
+    let sql_query = include_str!("../sql/select_user_by_username.sql");
+    let select_user_result: Result<User, sqlx::Error> = sqlx::query_as::<_, User>(sql_query)
+        .bind(username)
+        .fetch_one(pool)
+        .await;
+
+    select_user_result
+}
+
+async fn authenticate_refresh(
+    state: &AppState,
+    token: &String,
+) -> Result<PartialUser, AuthenticationError> {
+    let token_secret = state
+        .secrets
+        .get("REFRESH_TOKEN_SECRET")
+        .expect("secret must be set");
+
+    let key: Hmac<Sha256> =
+        Hmac::new_from_slice(token_secret.as_bytes()).expect("HMAC key should be valid");
+
+    let claims: BTreeMap<String, String> = token
+        .verify_with_key(&key)
+        .map_err(|_| AuthenticationError::InvalidToken)?;
+
+    let username = claims
+        .get("username")
+        .ok_or(AuthenticationError::InvalidToken)?
+        .clone();
+    let name = claims
+        .get("name")
+        .ok_or(AuthenticationError::InvalidToken)?
+        .clone();
+
+    let user_exists = user_query(&state.pool, &username).await;
+
+    match user_exists {
+        Ok(_) => {
+            return Ok(PartialUser { username, name });
+        }
+        Err(_) => {
+            return Err(AuthenticationError::InvalidToken);
+        }
+    }
+}
+
+pub async fn authenticate_token(
+    state: &AppState,
     headers: HeaderMap,
 ) -> Result<PartialUser, AuthenticationError> {
     let auth_header = if let Some(header) = headers.get(header::AUTHORIZATION) {
@@ -72,7 +119,10 @@ pub fn authenticate_token(
         return Err(AuthenticationError::InvalidToken);
     };
 
-    let token_secret = secrets.get("JWT_SECRET").expect("JWT_SECRET must be set");
+    let token_secret = state
+        .secrets
+        .get("JWT_SECRET")
+        .expect("JWT_SECRET must be set");
 
     let key: Hmac<Sha256> =
         Hmac::new_from_slice(token_secret.as_bytes()).expect("HMAC key should be valid");
@@ -90,7 +140,16 @@ pub fn authenticate_token(
         .ok_or(AuthenticationError::InvalidToken)?
         .clone();
 
-    Ok(PartialUser { username, name })
+    let user_exists = user_query(&state.pool, &username).await;
+
+    match user_exists {
+        Ok(_) => {
+            return Ok(PartialUser { username, name });
+        }
+        Err(_) => {
+            return Err(AuthenticationError::InvalidToken);
+        }
+    }
 }
 
 fn create_refresh_cookie(refresh_token: &String) -> Cookie<'_> {
@@ -132,9 +191,8 @@ fn auth_response(
 pub async fn authentication_tester(
     State(state): State<AppState>,
     headers: HeaderMap,
-    // Json(payload): Json<SignUpPayload>,
 ) -> impl IntoResponse {
-    let partial_user = authenticate_token(state.secrets, headers);
+    let partial_user = authenticate_token(&state, headers).await;
 
     match partial_user {
         Ok(user) => {
@@ -165,11 +223,7 @@ pub async fn signup_handler(
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
 
-    let sql_query = include_str!("../sql/select_user_by_username.sql");
-    let select_user_result: Result<User, sqlx::Error> = sqlx::query_as::<_, User>(sql_query)
-        .bind(&payload.username)
-        .fetch_one(&state.pool)
-        .await;
+    let select_user_result = user_query(&state.pool, &(payload.username)).await;
 
     match select_user_result {
         Ok(_) => {
@@ -227,11 +281,7 @@ pub async fn login_handler(
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
 
-    let sql_query = include_str!("../sql/select_user_by_username.sql");
-    let user_result: Result<User, sqlx::Error> = sqlx::query_as::<_, User>(sql_query)
-        .bind(payload.username)
-        .fetch_one(&state.pool)
-        .await;
+    let user_result = user_query(&state.pool, &payload.username).await;
 
     match user_result {
         Ok(user) => {
@@ -268,4 +318,36 @@ pub async fn login_handler(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response();
         }
     }
+}
+
+pub async fn refresh_handler(jar: CookieJar, State(state): State<AppState>) -> impl IntoResponse {
+    let refresh_token: String = match jar.get("refreshToken") {
+        Some(cookie) => cookie.value().to_string(),
+
+        None => {
+            let error = json!({ "message": "Refresh token not found" });
+            return (StatusCode::UNAUTHORIZED, Json(error));
+        }
+    };
+
+    let partial_user: PartialUser = match authenticate_refresh(&state, &refresh_token).await {
+        Ok(user) => user,
+        Err(AuthenticationError::InvalidToken) => {
+            let error = json!({ "message": "Invalid Token" });
+            return (StatusCode::UNAUTHORIZED, Json(error));
+        }
+        Err(AuthenticationError::TokenNotFound) => {
+            let error = json!({ "message": "Token not found" });
+            return (StatusCode::UNAUTHORIZED, Json(error));
+        }
+    };
+
+    let new_token = generate_token(TokenType::RegularToken, &state.secrets, &partial_user, 4);
+
+    let response_json = json!({
+    "message": "Token gerado com sucesso",
+    "token" : new_token,
+    });
+
+    return (StatusCode::OK, Json(response_json));
 }
