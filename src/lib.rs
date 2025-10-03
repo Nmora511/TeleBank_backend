@@ -2,8 +2,31 @@ pub mod connect_db;
 pub mod routes;
 use chrono::NaiveDateTime;
 use serde::Deserialize;
-use sqlx::{FromRow, Pool, Postgres};
+use sqlx::{Error, FromRow, Pool, Postgres};
 use uuid::Uuid;
+
+pub async fn user_query_by_id(pool: &Pool<Postgres>, id: &Uuid) -> Result<User, Error> {
+    let sql_query = include_str!("sql/select_user_by_id.sql");
+    let select_user_result: Result<User, sqlx::Error> = sqlx::query_as::<_, User>(sql_query)
+        .bind(id)
+        .fetch_one(pool)
+        .await;
+
+    select_user_result
+}
+
+pub async fn user_query_by_username(
+    pool: &Pool<Postgres>,
+    username: &String,
+) -> Result<User, Error> {
+    let sql_query = include_str!("sql/select_user_by_username.sql");
+    let select_user_result: Result<User, sqlx::Error> = sqlx::query_as::<_, User>(sql_query)
+        .bind(username)
+        .fetch_one(pool)
+        .await;
+
+    select_user_result
+}
 
 #[derive(Deserialize)]
 pub struct LoginPayload {
@@ -31,6 +54,7 @@ pub enum AuthenticationError {
 }
 
 pub struct PartialUser {
+    id: Uuid,
     username: String,
     name: String,
 }

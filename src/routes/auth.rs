@@ -1,4 +1,7 @@
-use crate::{AppState, AuthenticationError, LoginPayload, PartialUser, SignUpPayload, User};
+use crate::{
+    AppState, AuthenticationError, LoginPayload, PartialUser, SignUpPayload, user_query_by_id,
+    user_query_by_username,
+};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State, http::StatusCode, http::header};
@@ -11,8 +14,10 @@ use jwt::{SignWithKey, VerifyWithKey};
 use rand::{TryRngCore, rngs::OsRng};
 use serde_json::json;
 use sha2::Sha256;
-use sqlx::{Error, Pool, Postgres, Result};
+use sqlx::Result;
 use std::collections::BTreeMap;
+use std::str::FromStr;
+use uuid::Uuid;
 
 #[derive(PartialEq)]
 pub enum TokenType {
@@ -44,6 +49,7 @@ fn generate_token(
     let mut claims = BTreeMap::new();
     claims.insert("username", user.username.clone());
     claims.insert("name", user.name.clone());
+    claims.insert("id", String::from(user.id.clone()));
     claims.insert("exp", expiration.to_string());
 
     let key: Hmac<Sha256> =
@@ -52,16 +58,6 @@ fn generate_token(
     let token: String = claims.sign_with_key(&key).expect("Failed to sign token");
 
     return token;
-}
-
-pub async fn user_query(pool: &Pool<Postgres>, username: &String) -> Result<User, Error> {
-    let sql_query = include_str!("../sql/select_user_by_username.sql");
-    let select_user_result: Result<User, sqlx::Error> = sqlx::query_as::<_, User>(sql_query)
-        .bind(username)
-        .fetch_one(pool)
-        .await;
-
-    select_user_result
 }
 
 async fn authenticate_refresh(
@@ -88,12 +84,21 @@ async fn authenticate_refresh(
         .get("name")
         .ok_or(AuthenticationError::InvalidToken)?
         .clone();
+    let id_str = claims
+        .get("id")
+        .ok_or(AuthenticationError::InvalidToken)?
+        .clone();
 
-    let user_exists = user_query(&state.pool, &username).await;
+    let id = match Uuid::from_str(id_str.as_str()) {
+        Ok(id) => id,
+        Err(_) => return Err(AuthenticationError::InvalidToken),
+    };
+
+    let user_exists = user_query_by_id(&state.pool, &id).await;
 
     match user_exists {
         Ok(_) => {
-            return Ok(PartialUser { username, name });
+            return Ok(PartialUser { id, username, name });
         }
         Err(_) => {
             return Err(AuthenticationError::InvalidToken);
@@ -139,12 +144,21 @@ pub async fn authenticate_token(
         .get("name")
         .ok_or(AuthenticationError::InvalidToken)?
         .clone();
+    let id_str = claims
+        .get("id")
+        .ok_or(AuthenticationError::InvalidToken)?
+        .clone();
 
-    let user_exists = user_query(&state.pool, &username).await;
+    let id = match Uuid::from_str(id_str.as_str()) {
+        Ok(id) => id,
+        Err(_) => return Err(AuthenticationError::InvalidToken),
+    };
+
+    let user_exists = user_query_by_id(&state.pool, &id).await;
 
     match user_exists {
         Ok(_) => {
-            return Ok(PartialUser { username, name });
+            return Ok(PartialUser { id, username, name });
         }
         Err(_) => {
             return Err(AuthenticationError::InvalidToken);
@@ -223,7 +237,7 @@ pub async fn signup_handler(
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
 
-    let select_user_result = user_query(&state.pool, &(payload.username)).await;
+    let select_user_result = user_query_by_username(&state.pool, &(payload.username)).await;
 
     match select_user_result {
         Ok(_) => {
@@ -258,9 +272,18 @@ pub async fn signup_handler(
 
     match insert_user_result {
         Ok(_) => {
+            let inserted_user = match user_query_by_username(&state.pool, &payload.username).await {
+                Ok(user) => user,
+                Err(_) => {
+                    let error = json!({"message" : "Erro interno de servidor"});
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response();
+                }
+            };
+
             let user: PartialUser = PartialUser {
-                username: (payload.username),
-                name: (payload.name),
+                id: (inserted_user.id),
+                username: (inserted_user.username),
+                name: (inserted_user.name),
             };
 
             return auth_response(&state.secrets, &user, "Conta criada com sucesso");
@@ -281,7 +304,7 @@ pub async fn login_handler(
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
 
-    let user_result = user_query(&state.pool, &payload.username).await;
+    let user_result = user_query_by_username(&state.pool, &payload.username).await;
 
     match user_result {
         Ok(user) => {
@@ -299,6 +322,7 @@ pub async fn login_handler(
                     }
 
                     let partial_user: PartialUser = PartialUser {
+                        id: (user.id),
                         username: (user.username),
                         name: (user.name),
                     };
